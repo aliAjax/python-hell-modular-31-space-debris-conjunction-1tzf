@@ -18,7 +18,8 @@ def build_handler(service, static_dir):
             actor = self.headers.get("X-User-Id", "").strip()
             role = self.headers.get("X-Role", "").strip()
             region = self.headers.get("X-Region", "").strip() or None
-            return actor, role, region
+            org = self.headers.get("X-Org", "").strip() or None
+            return actor, role, region, org
 
         def _json_body(self):
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -41,7 +42,10 @@ def build_handler(service, static_dir):
         def _error(self, exc):
             status = getattr(exc, "status", 500)
             code = getattr(exc, "code", "internal_error")
-            self._send(status, {"error": code, "message": str(exc)})
+            body = {"error": code, "message": str(exc)}
+            if getattr(exc, "payload", None):
+                body["details"] = exc.payload
+            self._send(status, body)
 
         def do_GET(self):
             try:
@@ -52,12 +56,16 @@ def build_handler(service, static_dir):
                     return self._send(200, service.state())
                 if path == "/api/items":
                     return self._send(200, {"items": service.list_items()})
+                if path == "/api/cases":
+                    return self._send(200, {"cases": service.list_cases()})
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["api", "items"]:
                     return self._send(200, service.get_item(int(parts[2])))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "audit":
                     item = service.get_item(int(parts[2]))
                     return self._send(200, {"events": item["audit"]})
+                if len(parts) == 3 and parts[:2] == ["api", "cases"]:
+                    return self._send(200, service.get_case(int(parts[2])))
                 if path == "/":
                     file_path = os.path.join(static_dir, "index.html")
                     with open(file_path, "rb") as handle:
@@ -70,9 +78,9 @@ def build_handler(service, static_dir):
                 return self._error(DomainError("invalid_request", str(exc), 400))
 
         def do_POST(self):
-            actor = role = region = None
+            actor = role = region = org = None
             try:
-                actor, role, region = self._identity()
+                actor, role, region, org = self._identity()
                 path = urlparse(self.path).path
                 payload = self._json_body()
                 parts = [part for part in path.split("/") if part]
@@ -85,7 +93,20 @@ def build_handler(service, static_dir):
                     if not action:
                         raise DomainError("action_required", "缺少 action", 400)
                     expected = payload.pop("expected_version", None)
-                    return self._send(200, service.act(int(parts[2]), action, payload, actor, role, expected, region))
+                    return self._send(200, service.act(int(parts[2]), action, payload, actor, role, expected, region, org))
+                if parts == ["api", "cases"]:
+                    return self._send(201, service.merge_cases(payload.get("item_ids", []), actor, role))
+                if len(parts) == 4 and parts[:2] == ["api", "cases"] and parts[3] == "sources":
+                    return self._send(201, service.add_case_source(int(parts[2]), payload, actor, role))
+                if len(parts) == 4 and parts[:2] == ["api", "cases"] and parts[3] == "actions":
+                    action = payload.pop("action", "")
+                    if not action:
+                        raise DomainError("action_required", "缺少 action", 400)
+                    expected = payload.pop("expected_version", None)
+                    return self._send(200, service.case_act(int(parts[2]), action, payload, actor, role, expected, org))
+                if len(parts) == 4 and parts[:2] == ["api", "cases"] and parts[3] == "split":
+                    expected = payload.pop("expected_version", None)
+                    return self._send(200, service.split_case(int(parts[2]), actor, role, expected))
                 return self._send(404, {"error": "not_found", "message": "接口不存在"})
             except DomainError as exc:
                 return self._error(exc)

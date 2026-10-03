@@ -19,6 +19,11 @@ class Repository:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _ensure_column(self, conn, table, column, decl):
+        cols = [row["name"] for row in conn.execute("PRAGMA table_info(%s)" % table).fetchall()]
+        if column not in cols:
+            conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, decl))
+
     def initialize(self):
         conn = self.connect()
         try:
@@ -41,6 +46,7 @@ class Repository:
                 CREATE TABLE IF NOT EXISTS sources (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id INTEGER NOT NULL,
+                    case_id INTEGER,
                     source_type TEXT NOT NULL,
                     external_id TEXT NOT NULL,
                     payload TEXT NOT NULL,
@@ -62,6 +68,7 @@ class Repository:
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id INTEGER,
+                    case_id INTEGER,
                     event_type TEXT NOT NULL,
                     actor TEXT,
                     role TEXT,
@@ -70,8 +77,34 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS coordination_cases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    payload TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_role TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS case_members (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL UNIQUE,
+                    member_role TEXT NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    joined_at TEXT NOT NULL,
+                    joined_by TEXT NOT NULL,
+                    FOREIGN KEY(case_id) REFERENCES coordination_cases(id),
+                    FOREIGN KEY(item_id) REFERENCES items(id)
+                );
                 """
             )
+            # 兼容旧库：补齐归并相关列
+            self._ensure_column(conn, "items", "case_id", "INTEGER")
+            self._ensure_column(conn, "sources", "case_id", "INTEGER")
+            self._ensure_column(conn, "audit_events", "case_id", "INTEGER")
         finally:
             conn.close()
 
@@ -89,10 +122,11 @@ class Repository:
         ).fetchone()
         return row["event_hash"] if row else "GENESIS"
 
-    def append_audit(self, conn, item_id, event_type, actor, role, payload):
+    def append_audit(self, conn, item_id, event_type, actor, role, payload, case_id=None):
         previous = self._last_hash(conn, item_id)
         event = {
             "item_id": item_id,
+            "case_id": case_id,
             "event_type": event_type,
             "actor": actor,
             "role": role,
@@ -101,8 +135,8 @@ class Repository:
         }
         event_hash = audit_hash(previous, event)
         conn.execute(
-            "INSERT INTO audit_events(item_id,event_type,actor,role,payload,previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (item_id, event_type, actor, role, canonical_json(payload), previous, event_hash, event["created_at"]),
+            "INSERT INTO audit_events(item_id,case_id,event_type,actor,role,payload,previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (item_id, case_id, event_type, actor, role, canonical_json(payload), previous, event_hash, event["created_at"]),
         )
 
     def create_item(self, entity_type, stable_key, initial_status, payload, actor, role):
@@ -197,15 +231,15 @@ class Repository:
     def list_sources(self, item_id):
         conn = self.connect()
         try:
-            rows = conn.execute("SELECT * FROM sources WHERE item_id=? ORDER BY id DESC", (item_id,)).fetchall()
-            result = []
-            for row in rows:
-                value = dict(row)
-                value["payload"] = json.loads(value["payload"])
-                result.append(value)
-            return result
+            rows = conn.execute("SELECT * FROM sources WHERE item_id=? ORDER BY observed_at DESC, id DESC", (item_id,)).fetchall()
+            return [self._source_row(row) for row in rows]
         finally:
             conn.close()
+
+    def _source_row(self, row):
+        value = dict(row)
+        value["payload"] = json.loads(value["payload"])
+        return value
 
     def apply_action(self, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version=None):
         conn = self.connect()
@@ -257,5 +291,331 @@ class Repository:
             for row in conn.execute("SELECT status, COUNT(*) AS total FROM items GROUP BY status").fetchall():
                 counts[row["status"]] = row["total"]
             return {"counts": counts, "items": self.list_items()}
+        finally:
+            conn.close()
+
+    # ---- 协调案 ----
+
+    def _case_members(self, conn, case_id):
+        rows = conn.execute(
+            """
+            SELECT i.*, cm.member_role AS member_role, cm.snapshot AS snapshot
+            FROM case_members cm JOIN items i ON i.id = cm.item_id
+            WHERE cm.case_id = ? ORDER BY cm.id
+            """,
+            (case_id,),
+        ).fetchall()
+        members = []
+        for row in rows:
+            item = self._row_to_item(row)
+            item["member_role"] = row["member_role"]
+            members.append(item)
+        return members
+
+    def _case_sources(self, conn, case_id):
+        rows = conn.execute(
+            "SELECT * FROM sources WHERE case_id=? ORDER BY observed_at DESC, id DESC",
+            (case_id,),
+        ).fetchall()
+        return [self._source_row(row) for row in rows]
+
+    def get_case(self, case_id):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT * FROM coordination_cases WHERE id=?", (case_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("case_not_found", "协调案不存在")
+            result = dict(row)
+            result["payload"] = json.loads(result["payload"])
+            result["members"] = self._case_members(conn, case_id)
+            result["sources"] = self._case_sources(conn, case_id)
+            result["basis"] = result["payload"].get("basis")
+            result["basis_history"] = result["payload"].get("basis_history", [])
+            return result
+        finally:
+            conn.close()
+
+    def list_cases(self):
+        conn = self.connect()
+        try:
+            rows = conn.execute("SELECT * FROM coordination_cases ORDER BY id DESC").fetchall()
+            result = []
+            for row in rows:
+                case = dict(row)
+                case["payload"] = json.loads(case["payload"])
+                result.append(case)
+            return result
+        finally:
+            conn.close()
+
+    def find_case_for_item(self, item_id):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT case_id FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None or row["case_id"] is None:
+                return None
+            return self.get_case(row["case_id"])
+        finally:
+            conn.close()
+
+    def create_case(self, payload, case_key, members, actor, role, initial_status="open"):
+        """members: [{"item": 记录行, "snapshot": {...}, "sources": [来源行]}]"""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # 并发归并控制：逐条检查是否已在其他协调案中
+            for member in members:
+                item_id = member["item"]["id"]
+                row = conn.execute("SELECT id, case_id, version FROM items WHERE id=?", (item_id,)).fetchone()
+                if row is None:
+                    raise NotFoundError("item_not_found", "业务实体不存在")
+                if row["case_id"] is not None:
+                    latest = conn.execute(
+                        "SELECT c.id, c.version FROM coordination_cases c WHERE c.id=?",
+                        (row["case_id"],),
+                    ).fetchone()
+                    raise ConflictError(
+                        "merge_conflict",
+                        "记录已被其他协调案归并",
+                        payload={
+                            "conflict_item_id": item_id,
+                            "case_id": row["case_id"],
+                            "latest_version": latest["version"] if latest else row["version"],
+                        },
+                    )
+            try:
+                cursor = conn.execute(
+                    "INSERT INTO coordination_cases(case_key,status,version,payload,created_by,created_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (case_key, initial_status, 1, canonical_json(payload), actor, role, now_iso(), now_iso()),
+                )
+            except sqlite3.IntegrityError:
+                existing = conn.execute(
+                    "SELECT id, version FROM coordination_cases WHERE case_key=?", (case_key,)
+                ).fetchone()
+                raise ConflictError(
+                    "merge_conflict",
+                    "同一协调案已被创建",
+                    payload={"case_id": existing["id"], "latest_version": existing["version"]},
+                )
+            case_id = cursor.lastrowid
+            primary_id = None
+            for member in members:
+                item_id = member["item"]["id"]
+                role_name = member.get("member_role", "member")
+                if role_name == "primary":
+                    primary_id = item_id
+                conn.execute(
+                    "INSERT INTO case_members(case_id,item_id,member_role,snapshot,joined_at,joined_by) VALUES(?,?,?,?,?,?)",
+                    (case_id, item_id, role_name, canonical_json(member["snapshot"]), now_iso(), actor),
+                )
+                conn.execute(
+                    "UPDATE items SET case_id=?, status='merged', updated_at=? WHERE id=?",
+                    (case_id, now_iso(), item_id),
+                )
+            if primary_id is None:
+                primary_id = members[0]["item"]["id"]
+            member_ids = [m["item"]["id"] for m in members]
+            placeholders = ",".join("?" for _ in member_ids)
+            conn.execute(
+                "UPDATE sources SET case_id=? WHERE item_id IN (%s)" % placeholders,
+                [case_id] + member_ids,
+            )
+            self.append_audit(
+                conn,
+                primary_id,
+                "case_merged",
+                actor,
+                role,
+                {"case_id": case_id, "item_ids": member_ids},
+                case_id=case_id,
+            )
+            conn.execute("COMMIT")
+            return self.get_case(case_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def apply_case_action(self, case_id, action, actor, role, new_status, new_payload, event_payload, expected_version):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM coordination_cases WHERE id=?", (case_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("case_not_found", "协调案不存在")
+            if expected_version is not None and int(expected_version) != int(row["version"]):
+                raise ConflictError("version_conflict", "协调案已被其他协调员更新，请重新读取")
+            version = int(row["version"]) + 1
+            conn.execute(
+                "UPDATE coordination_cases SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                (new_status, version, canonical_json(new_payload), now_iso(), case_id),
+            )
+            primary = conn.execute(
+                "SELECT item_id FROM case_members WHERE case_id=? AND member_role='primary'",
+                (case_id,),
+            ).fetchone()
+            audit_item = primary["item_id"] if primary else None
+            self.append_audit(conn, audit_item, action, actor, role, event_payload, case_id=case_id)
+            conn.execute("COMMIT")
+            return self.get_case(case_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def add_case_source(self, case_id, source_type, external_id, payload, observed_at, actor, role):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            case = conn.execute("SELECT id FROM coordination_cases WHERE id=?", (case_id,)).fetchone()
+            if case is None:
+                raise NotFoundError("case_not_found", "协调案不存在")
+            primary = conn.execute(
+                "SELECT item_id FROM case_members WHERE case_id=? AND member_role='primary'",
+                (case_id,),
+            ).fetchone()
+            item_id = primary["item_id"] if primary else None
+            try:
+                conn.execute(
+                    "INSERT INTO sources(item_id,case_id,source_type,external_id,payload,observed_at,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (item_id, case_id, source_type, external_id, canonical_json(payload), observed_at, now_iso()),
+                )
+            except sqlite3.IntegrityError:
+                raise ConflictError("duplicate_source", "同一来源记录已经提交")
+            source_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            self.append_audit(
+                conn,
+                item_id,
+                "case_source_recorded",
+                actor,
+                role,
+                {"case_id": case_id, "source_id": source_id, "source_type": source_type, "external_id": external_id},
+                case_id=case_id,
+            )
+            conn.execute("COMMIT")
+            return {"id": source_id, "case_id": case_id, "source_type": source_type, "external_id": external_id, "payload": payload, "observed_at": observed_at}
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def attach_source_to_case(self, source_id, case_id):
+        conn = self.connect()
+        try:
+            conn.execute("UPDATE sources SET case_id=? WHERE id=?", (case_id, source_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def update_case_payload(self, case_id, payload, expected_version, status=None):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT version FROM coordination_cases WHERE id=?", (case_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("case_not_found", "协调案不存在")
+            if expected_version is not None and int(expected_version) != int(row["version"]):
+                raise ConflictError("version_conflict", "协调案已被其他协调员更新，请重新读取")
+            version = int(row["version"]) + 1
+            if status is not None:
+                conn.execute(
+                    "UPDATE coordination_cases SET payload=?, status=?, version=?, updated_at=? WHERE id=?",
+                    (canonical_json(payload), status, version, now_iso(), case_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE coordination_cases SET payload=?, version=?, updated_at=? WHERE id=?",
+                    (canonical_json(payload), version, now_iso(), case_id),
+                )
+            conn.execute("COMMIT")
+            return self.get_case(case_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def split_case(self, case_id, actor, role, expected_version):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM coordination_cases WHERE id=?", (case_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("case_not_found", "协调案不存在")
+            if expected_version is not None and int(expected_version) != int(row["version"]):
+                raise ConflictError("version_conflict", "协调案已被其他协调员更新，请重新读取")
+            if row["status"] in ("executing", "resolved"):
+                raise DomainError("case_locked", "已下发规避指令的协调案不能拆回")
+            members = conn.execute("SELECT * FROM case_members WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
+            member_ids = []
+            for member in members:
+                item_id = member["item_id"]
+                member_ids.append(item_id)
+                snapshot = json.loads(member["snapshot"])
+                restored = dict(snapshot.get("payload", {}))
+                prior_status = snapshot.get("status", "pending")
+                # 未下发的批准随拆回失效；已下发指令保留原依据
+                if "approved_maneuver" in restored and "command_ref" not in restored:
+                    restored.pop("approved_maneuver", None)
+                    new_status = "assessed" if prior_status == "coordinating" else prior_status
+                else:
+                    new_status = prior_status
+                conn.execute(
+                    "UPDATE items SET status=?, payload=?, case_id=NULL, updated_at=? WHERE id=?",
+                    (new_status, canonical_json(restored), now_iso(), item_id),
+                )
+            version = int(row["version"]) + 1
+            conn.execute(
+                "UPDATE coordination_cases SET status='split', version=?, updated_at=? WHERE id=?",
+                (version, now_iso(), case_id),
+            )
+            primary = members[0]["item_id"] if members else None
+            self.append_audit(
+                conn,
+                primary,
+                "case_split",
+                actor,
+                role,
+                {"case_id": case_id, "item_ids": member_ids},
+                case_id=case_id,
+            )
+            conn.execute("COMMIT")
+            return self.get_case(case_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def record_denial(self, item_id, case_id, actor, role, code, detail):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self.append_audit(conn, item_id, code, actor, role, detail, case_id=case_id)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
         finally:
             conn.close()

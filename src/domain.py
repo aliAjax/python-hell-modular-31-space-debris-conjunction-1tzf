@@ -2,15 +2,16 @@ from datetime import datetime
 
 
 class DomainError(Exception):
-    def __init__(self, code, message, status=400):
+    def __init__(self, code, message, status=400, payload=None):
         super().__init__(message)
         self.code = code
         self.status = status
+        self.payload = payload or {}
 
 
 class ConflictError(DomainError):
-    def __init__(self, code, message):
-        super().__init__(code, message, 409)
+    def __init__(self, code, message, payload=None):
+        super().__init__(code, message, 409, payload=payload)
 
 
 class NotFoundError(DomainError):
@@ -90,6 +91,21 @@ def normalize_create(payload):
         "conflict": False,
         "_stable_key": stable_key,
     }
+
+
+def normalize_merge(payload):
+    raw = payload.get("item_ids")
+    if not isinstance(raw, list) or len(raw) < 2:
+        raise DomainError("invalid_merge", "归并至少需要两条记录")
+    item_ids = []
+    for value in raw:
+        try:
+            item_ids.append(int(value))
+        except (TypeError, ValueError):
+            raise DomainError("invalid_merge", "归并记录 id 必须是整数")
+    if len(set(item_ids)) != len(item_ids):
+        raise DomainError("invalid_merge", "归并记录不能重复")
+    return {"item_ids": item_ids}
 
 
 def normalize_source(payload):

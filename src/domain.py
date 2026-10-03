@@ -2,15 +2,16 @@ from datetime import datetime
 
 
 class DomainError(Exception):
-    def __init__(self, code, message, status=400):
+    def __init__(self, code, message, status=400, details=None):
         super().__init__(message)
         self.code = code
         self.status = status
+        self.details = details or {}
 
 
 class ConflictError(DomainError):
-    def __init__(self, code, message):
-        super().__init__(code, message, 409)
+    def __init__(self, code, message, details=None):
+        super().__init__(code, message, 409, details)
 
 
 class NotFoundError(DomainError):
@@ -75,6 +76,9 @@ def normalize_create(payload):
     operators = payload.get("operating_organizations", [])
     if not isinstance(operators, list) or any(not isinstance(item, str) or not item.strip() for item in operators):
         raise DomainError("invalid_operators", "运营方必须是字符串列表")
+    observed_at = payload.get("observed_at")
+    if observed_at is not None:
+        observed_at = parse_timestamp({"observed_at": observed_at}, "observed_at")
     stable_key = "%s|%s|%s" % tuple(sorted([primary, secondary]) + [tca])
     return {
         "primary_object_id": primary,
@@ -84,6 +88,7 @@ def normalize_create(payload):
         "covariance_m": covariance,
         "fuel_budget_m_s": fuel_budget,
         "track_age_hours": track_age,
+        "observed_at": observed_at,
         "operating_organizations": [item.strip() for item in operators],
         "revisions": [],
         "opinions": [],

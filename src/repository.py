@@ -215,7 +215,11 @@ class Repository:
             if row is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
             if expected_version is not None and int(expected_version) != int(row["version"]):
-                raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取")
+                raise ConflictError(
+                    "version_conflict",
+                    "记录已被其他操作更新，请重新读取",
+                    {"conflict_item_id": item_id, "current_version": int(row["version"])},
+                )
             version = int(row["version"]) + 1
             conn.execute(
                 "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
@@ -228,6 +232,120 @@ class Repository:
             self.append_audit(conn, item_id, action, actor, role, event_payload)
             conn.execute("COMMIT")
             return self.get_item(item_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def _locked_item(self, conn, item_id):
+        row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("item_not_found", "业务实体不存在")
+        return row
+
+    def _check_version(self, row, item_id, expected_version):
+        if expected_version is None or int(expected_version) != int(row["version"]):
+            raise ConflictError(
+                "version_conflict",
+                "记录已被其他操作更新，请重新读取",
+                {"conflict_item_id": item_id, "current_version": int(row["version"])},
+            )
+
+    def _update_locked_item(self, conn, item_id, status, payload):
+        row = self._locked_item(conn, item_id)
+        version = int(row["version"]) + 1
+        conn.execute(
+            "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+            (status, version, canonical_json(payload), now_iso(), item_id),
+        )
+        return version
+
+    def merge_items(self, survivor_id, merged_id, actor, role, survivor_status, survivor_payload,
+                    merged_status, merged_payload, event_payload, expected_version, other_expected_version):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            survivor = self._locked_item(conn, survivor_id)
+            merged = self._locked_item(conn, merged_id)
+            self._check_version(survivor, survivor_id, expected_version)
+            self._check_version(merged, merged_id, other_expected_version)
+            if merged["status"] == "merged":
+                raise ConflictError(
+                    "already_merged",
+                    "该记录已被归并，不能重复归并",
+                    {"conflict_item_id": merged_id, "current_version": int(merged["version"])},
+                )
+            self._update_locked_item(conn, survivor_id, survivor_status, survivor_payload)
+            self._update_locked_item(conn, merged_id, merged_status, merged_payload)
+            conn.execute(
+                "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                (survivor_id, "merge", actor, role, canonical_json(event_payload), now_iso()),
+            )
+            conn.execute(
+                "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                (merged_id, "merge", actor, role, canonical_json(event_payload), now_iso()),
+            )
+            self.append_audit(conn, survivor_id, "merge", actor, role, event_payload)
+            self.append_audit(conn, merged_id, "merged_into", actor, role, event_payload)
+            conn.execute("COMMIT")
+            return self.get_item(survivor_id), self.get_item(merged_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def split_items(self, survivor_id, merged_id, actor, role, survivor_status, survivor_payload,
+                    merged_status, merged_payload, event_payload, expected_version):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            survivor = self._locked_item(conn, survivor_id)
+            merged = self._locked_item(conn, merged_id)
+            self._check_version(survivor, survivor_id, expected_version)
+            if merged["status"] != "merged":
+                raise ConflictError(
+                    "not_merged",
+                    "该记录当前不是已归并状态，不能拆回",
+                    {"conflict_item_id": merged_id, "current_version": int(merged["version"])},
+                )
+            self._update_locked_item(conn, survivor_id, survivor_status, survivor_payload)
+            self._update_locked_item(conn, merged_id, merged_status, merged_payload)
+            conn.execute(
+                "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                (survivor_id, "split", actor, role, canonical_json(event_payload), now_iso()),
+            )
+            conn.execute(
+                "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                (merged_id, "split", actor, role, canonical_json(event_payload), now_iso()),
+            )
+            self.append_audit(conn, survivor_id, "split", actor, role, event_payload)
+            self.append_audit(conn, merged_id, "split_restored", actor, role, event_payload)
+            conn.execute("COMMIT")
+            return self.get_item(survivor_id), self.get_item(merged_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def record_rejection(self, item_id, event_type, actor, role, payload):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._locked_item(conn, item_id)
+            self.append_audit(conn, item_id, event_type, actor, role, payload)
+            conn.execute("COMMIT")
         except Exception:
             try:
                 conn.execute("ROLLBACK")
